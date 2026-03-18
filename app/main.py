@@ -2,23 +2,21 @@ import logging
 import uuid
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
-from redis import Redis
-from rq import Queue
-from rq.job import Job, NoSuchJobError
 
 from .config import settings
-from .tasks import pack_files, render_stl, RENDERED_PREFIX
+from .tasks import pack_files, render_stl
 
 logger = logging.getLogger("process-files-thread")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 app = FastAPI(title="satellite-process-files-thread")
 
-redis_conn = Redis.from_url(settings.redis_url)
-queue = Queue("thread", connection=redis_conn)
+# In-memory job status — good enough since NestJS uses webhook callbacks
+# and PackingTimeoutService handles stalled jobs after 10 min.
+_jobs: dict[str, dict] = {}
 
 
 class PackFileEntry(BaseModel):
@@ -46,17 +44,37 @@ class RenderResponse(BaseModel):
     status: str
 
 
+def _run_pack(job_id: str, file_dicts: list[dict], webhook_url: str) -> None:
+    _jobs[job_id] = {"status": "processing"}
+    try:
+        result = pack_files(job_id, file_dicts, webhook_url)
+        _jobs[job_id] = {"status": "completed", "result": result}
+    except Exception as e:
+        logger.error(f"pack_job_failed job_id={job_id} error={e}")
+        _jobs[job_id] = {"status": "failed", "error": str(e)}
+
+
+def _run_render(job_id: str, file_key: str, webhook_url: str) -> None:
+    _jobs[job_id] = {"status": "processing"}
+    try:
+        result = render_stl(job_id, file_key, webhook_url)
+        _jobs[job_id] = {"status": "completed", "result": result}
+    except Exception as e:
+        logger.error(f"render_job_failed job_id={job_id} error={e}")
+        _jobs[job_id] = {"status": "failed", "error": str(e)}
+
+
 @app.post("/render", response_model=RenderResponse, status_code=202)
-def render(request: RenderRequest):
+def render(request: RenderRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     logger.info(f"render_request_received job_id={job_id} key={request.key} webhook={request.webhook_url}")
-    queue.enqueue(render_stl, job_id, request.key, request.webhook_url, job_id=job_id)
-    logger.info(f"render_job_enqueued job_id={job_id}")
+    background_tasks.add_task(_run_render, job_id, request.key, request.webhook_url)
+    logger.info(f"render_job_queued job_id={job_id}")
     return RenderResponse(job_id=job_id, status="queued")
 
 
 @app.post("/pack", response_model=PackResponse, status_code=202)
-def pack(request: PackRequest):
+def pack(request: PackRequest, background_tasks: BackgroundTasks):
     file_keys = [f.key for f in request.files]
     logger.info(f"pack_request_received files={len(request.files)} webhook={request.webhook_url} keys={file_keys}")
     if not request.files:
@@ -66,31 +84,18 @@ def pack(request: PackRequest):
     job_id = str(uuid.uuid4())
     file_dicts = [{"key": f.key, "name": f.name} for f in request.files]
     logger.info(f"pack_enqueueing job_id={job_id} files={file_dicts}")
-    queue.enqueue(pack_files, job_id, file_dicts, request.webhook_url, job_id=job_id)
-    logger.info(f"pack_job_enqueued job_id={job_id}")
-
+    background_tasks.add_task(_run_pack, job_id, file_dicts, request.webhook_url)
+    logger.info(f"pack_job_queued job_id={job_id}")
     return PackResponse(job_id=job_id, status="queued")
 
 
 @app.get("/pack/{job_id}")
 def get_pack_status(job_id: str):
     logger.info(f"pack_status_request job_id={job_id}")
-    try:
-        job = Job.fetch(job_id, connection=redis_conn)
-    except NoSuchJobError:
-        logger.warning(f"pack_status_job_not_found job_id={job_id}")
+    job = _jobs.get(job_id)
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
-    status = job.get_status()
-    logger.info(f"pack_status_response job_id={job_id} status={status}")
-    response = {"job_id": job_id, "status": str(status)}
-
-    if job.is_finished:
-        response["result"] = job.result
-    elif job.is_failed:
-        response["error"] = str(job.exc_info)
-
-    return response
+    return {"job_id": job_id, **job}
 
 
 @app.get("/openapi.yaml", include_in_schema=False)
