@@ -1,4 +1,5 @@
 import io
+import logging
 import zipfile
 import boto3
 import urllib.request
@@ -8,6 +9,8 @@ from botocore.exceptions import ClientError
 
 from .config import settings
 
+logger = logging.getLogger("process-files-thread.tasks")
+
 
 def _resolve_webhook_url(webhook_url: str) -> str:
     """Replace the origin of webhook_url with settings.backend_url so the worker
@@ -15,7 +18,9 @@ def _resolve_webhook_url(webhook_url: str) -> str:
     parsed = urllib.parse.urlparse(webhook_url)
     base = urllib.parse.urlparse(settings.backend_url)
     resolved = parsed._replace(scheme=base.scheme, netloc=base.netloc)
-    return urllib.parse.urlunparse(resolved)
+    resolved_url = urllib.parse.urlunparse(resolved)
+    logger.info(f"webhook_url_resolved original={webhook_url} resolved={resolved_url} backend_url={settings.backend_url}")
+    return resolved_url
 
 
 def _make_s3_client():
@@ -29,6 +34,7 @@ def _make_s3_client():
 
 
 def _fire_webhook(webhook_url: str, payload: dict) -> None:
+    logger.info(f"webhook_firing url={webhook_url} payload={json.dumps(payload)}")
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         webhook_url,
@@ -36,8 +42,12 @@ def _fire_webhook(webhook_url: str, payload: dict) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10):
-        pass
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(f"webhook_fired url={webhook_url} status={resp.status}")
+    except Exception as e:
+        logger.error(f"webhook_failed url={webhook_url} error={e}")
+        raise
 
 
 RENDERED_PREFIX = "rendered-files"
@@ -45,6 +55,8 @@ RENDERED_PREFIX = "rendered-files"
 
 def render_stl(job_id: str, file_key: str, webhook_url: str) -> dict:
     """Downloads STL from S3, renders a gray PNG on a dark background, uploads PNG, fires webhook."""
+    logger.info(f"render_start job_id={job_id} key={file_key} webhook={webhook_url}")
+
     import trimesh
     import numpy as np
     import matplotlib
@@ -54,8 +66,10 @@ def render_stl(job_id: str, file_key: str, webhook_url: str) -> dict:
 
     s3 = _make_s3_client()
 
+    logger.info(f"render_downloading_stl job_id={job_id} key={file_key} bucket={settings.s3_bucket}")
     response = s3.get_object(Bucket=settings.s3_bucket, Key=file_key)
     stl_bytes = response["Body"].read()
+    logger.info(f"render_stl_downloaded job_id={job_id} size={len(stl_bytes)}")
 
     loaded = trimesh.load(io.BytesIO(stl_bytes), file_type="stl", force="mesh")
     if isinstance(loaded, trimesh.Scene):
@@ -96,14 +110,17 @@ def render_stl(job_id: str, file_key: str, webhook_url: str) -> dict:
     out_buffer.seek(0)
 
     output_key = f"{RENDERED_PREFIX}/{job_id}.png"
+    logger.info(f"render_uploading job_id={job_id} output_key={output_key}")
     s3.put_object(
         Bucket=settings.s3_bucket,
         Key=output_key,
         Body=out_buffer.getvalue(),
         ContentType="image/png",
     )
+    logger.info(f"render_uploaded job_id={job_id} output_key={output_key}")
 
     _fire_webhook(_resolve_webhook_url(webhook_url), {"id": job_id, "output_key": output_key})
+    logger.info(f"render_done job_id={job_id}")
     return {"job_id": job_id, "output_key": output_key, "status": "completed"}
 
 
@@ -115,6 +132,8 @@ def pack_files(job_id: str, files: list[dict], webhook_url: str) -> dict:
 
     Each entry in `files` must have `key` (S3 key) and `name` (archive filename).
     """
+    logger.info(f"pack_start job_id={job_id} files={len(files)} webhook={webhook_url}")
+
     s3 = _make_s3_client()
 
     zip_buffer = io.BytesIO()
@@ -124,30 +143,38 @@ def pack_files(job_id: str, files: list[dict], webhook_url: str) -> dict:
         for entry in files:
             key = entry["key"]
             archive_name = entry["name"]
+            logger.info(f"pack_downloading job_id={job_id} key={key} archive_name={archive_name}")
             try:
                 response = s3.get_object(Bucket=settings.s3_bucket, Key=key)
                 file_data = response["Body"].read()
                 zf.writestr(archive_name, file_data)
+                logger.info(f"pack_file_added job_id={job_id} key={key} size={len(file_data)}")
             except ClientError as e:
+                logger.error(f"pack_file_failed job_id={job_id} key={key} error={e}")
                 failed.append({"key": key, "error": str(e)})
 
     if failed and not zip_buffer.getbuffer().nbytes:
+        logger.error(f"pack_all_files_failed job_id={job_id} failed={failed}")
         raise RuntimeError(f"All files failed to download: {failed}")
 
     zip_buffer.seek(0)
     output_key = f"{settings.packed_files_prefix}/{job_id}.zip"
 
+    logger.info(f"pack_uploading job_id={job_id} output_key={output_key} zip_size={len(zip_buffer.getvalue())} failed_count={len(failed)}")
     s3.put_object(
         Bucket=settings.s3_bucket,
         Key=output_key,
         Body=zip_buffer.getvalue(),
         ContentType="application/zip",
     )
+    logger.info(f"pack_uploaded job_id={job_id} output_key={output_key}")
 
     result = {"job_id": job_id, "output_key": output_key, "status": "completed"}
     if failed:
         result["failed_files"] = failed
+        logger.warning(f"pack_partial_failures job_id={job_id} failed={failed}")
 
     _fire_webhook(_resolve_webhook_url(webhook_url), {"id": job_id, "output_key": output_key})
+    logger.info(f"pack_done job_id={job_id} output_key={output_key}")
 
     return result
