@@ -132,35 +132,43 @@ def pack_files(job_id: str, files: list[dict], webhook_url: str) -> dict:
 
     Each entry in `files` must have `key` (S3 key) and `name` (archive filename).
     """
-    logger.info(f"pack_start job_id={job_id} files={len(files)} webhook={webhook_url}")
+    file_keys = [f["key"] for f in files]
+    logger.info(f"pack_start job_id={job_id} files={len(files)} webhook={webhook_url} keys={file_keys}")
 
     s3 = _make_s3_client()
+    logger.info(f"pack_s3_client_ready job_id={job_id} bucket={settings.s3_bucket} endpoint={settings.s3_endpoint}")
 
     zip_buffer = io.BytesIO()
     failed = []
+    succeeded = 0
 
+    logger.info(f"pack_zip_building job_id={job_id}")
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for entry in files:
+        for i, entry in enumerate(files):
             key = entry["key"]
             archive_name = entry["name"]
-            logger.info(f"pack_downloading job_id={job_id} key={key} archive_name={archive_name}")
+            logger.info(f"pack_downloading job_id={job_id} file={i+1}/{len(files)} key={key} archive_name={archive_name}")
             try:
                 response = s3.get_object(Bucket=settings.s3_bucket, Key=key)
                 file_data = response["Body"].read()
                 zf.writestr(archive_name, file_data)
-                logger.info(f"pack_file_added job_id={job_id} key={key} size={len(file_data)}")
+                succeeded += 1
+                logger.info(f"pack_file_added job_id={job_id} file={i+1}/{len(files)} key={key} size={len(file_data)}")
             except ClientError as e:
-                logger.error(f"pack_file_failed job_id={job_id} key={key} error={e}")
+                logger.error(f"pack_file_failed job_id={job_id} file={i+1}/{len(files)} key={key} error={e}")
                 failed.append({"key": key, "error": str(e)})
 
-    if failed and not zip_buffer.getbuffer().nbytes:
+    zip_size = zip_buffer.getbuffer().nbytes
+    logger.info(f"pack_zip_built job_id={job_id} succeeded={succeeded} failed={len(failed)} zip_size={zip_size}")
+
+    if failed and not zip_size:
         logger.error(f"pack_all_files_failed job_id={job_id} failed={failed}")
         raise RuntimeError(f"All files failed to download: {failed}")
 
     zip_buffer.seek(0)
     output_key = f"{settings.packed_files_prefix}/{job_id}.zip"
 
-    logger.info(f"pack_uploading job_id={job_id} output_key={output_key} zip_size={len(zip_buffer.getvalue())} failed_count={len(failed)}")
+    logger.info(f"pack_uploading job_id={job_id} output_key={output_key} zip_size={zip_size} bucket={settings.s3_bucket}")
     s3.put_object(
         Bucket=settings.s3_bucket,
         Key=output_key,
@@ -174,7 +182,9 @@ def pack_files(job_id: str, files: list[dict], webhook_url: str) -> dict:
         result["failed_files"] = failed
         logger.warning(f"pack_partial_failures job_id={job_id} failed={failed}")
 
-    _fire_webhook(_resolve_webhook_url(webhook_url), {"id": job_id, "output_key": output_key})
+    resolved_webhook = _resolve_webhook_url(webhook_url)
+    logger.info(f"pack_firing_webhook job_id={job_id} webhook={resolved_webhook}")
+    _fire_webhook(resolved_webhook, {"id": job_id, "output_key": output_key})
     logger.info(f"pack_done job_id={job_id} output_key={output_key}")
 
     return result
