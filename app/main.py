@@ -57,9 +57,10 @@ def render(request: RenderRequest):
 
 @app.post("/pack", response_model=PackResponse, status_code=202)
 def pack(request: PackRequest):
-    logger.info(f"pack_request_received files={len(request.files)} webhook={request.webhook_url}")
+    file_keys = [f.key for f in request.files]
+    logger.info(f"pack_request_received files={len(request.files)} webhook={request.webhook_url} keys={file_keys}")
     if not request.files:
-        logger.warning("pack_request_no_files")
+        logger.warning(f"pack_request_no_files webhook={request.webhook_url}")
         raise HTTPException(status_code=400, detail="No files provided")
 
     job_id = str(uuid.uuid4())
