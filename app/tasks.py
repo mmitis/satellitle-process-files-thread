@@ -3,7 +3,6 @@ import logging
 import zipfile
 import boto3
 import urllib.request
-import urllib.parse
 import json
 from botocore.exceptions import ClientError
 
@@ -11,16 +10,6 @@ from .config import settings
 
 logger = logging.getLogger("process-files-thread.tasks")
 
-
-def _resolve_webhook_url(webhook_url: str) -> str:
-    """Replace the origin of webhook_url with settings.backend_url so the worker
-    can reach the backend even when running inside Docker."""
-    parsed = urllib.parse.urlparse(webhook_url)
-    base = urllib.parse.urlparse(settings.backend_url)
-    resolved = parsed._replace(scheme=base.scheme, netloc=base.netloc)
-    resolved_url = urllib.parse.urlunparse(resolved)
-    logger.info(f"webhook_url_resolved original={webhook_url} resolved={resolved_url} backend_url={settings.backend_url}")
-    return resolved_url
 
 
 def _make_s3_client():
@@ -119,7 +108,7 @@ def render_stl(job_id: str, file_key: str, webhook_url: str) -> dict:
     )
     logger.info(f"render_uploaded job_id={job_id} output_key={output_key}")
 
-    _fire_webhook(_resolve_webhook_url(webhook_url), {"id": job_id, "output_key": output_key})
+    _fire_webhook(webhook_url, {"id": job_id, "output_key": output_key})
     logger.info(f"render_done job_id={job_id}")
     return {"job_id": job_id, "output_key": output_key, "status": "completed"}
 
@@ -182,9 +171,8 @@ def pack_files(job_id: str, files: list[dict], webhook_url: str) -> dict:
         result["failed_files"] = failed
         logger.warning(f"pack_partial_failures job_id={job_id} failed={failed}")
 
-    resolved_webhook = _resolve_webhook_url(webhook_url)
-    logger.info(f"pack_firing_webhook job_id={job_id} webhook={resolved_webhook}")
-    _fire_webhook(resolved_webhook, {"id": job_id, "output_key": output_key})
+    logger.info(f"pack_firing_webhook job_id={job_id} webhook={webhook_url}")
+    _fire_webhook(webhook_url, {"id": job_id, "output_key": output_key})
     logger.info(f"pack_done job_id={job_id} output_key={output_key}")
 
     return result
